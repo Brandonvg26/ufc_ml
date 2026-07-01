@@ -33,12 +33,18 @@ INPUT_CSV     = r"ufc_data\lists\list_fights.csv"     # CSV containing the fight
 URL_COLUMN    = "fight_url"     # column to read; if absent, the first column is used
 MAX_FIGHTS    = None             # None = all rows; int caps it (use 2-3 to test)
 OUTPUT_DIR    = r"ufc_data\raw"      # created if missing
-FETCH_BACKEND = "cloudscraper"    # "playwright" | "cloudscraper" | "curl_cffi"
+FETCH_BACKEND = "playwright_async"  # "playwright_async" | "playwright" | "cloudscraper" | "curl_cffi"
+                                    #   playwright_async = ONE browser, many concurrent tabs (fast + reliable)
+                                    #   playwright       = ONE browser, one tab, sequential (slow, the old default)
+                                    #   cloudscraper/curl_cffi = pure HTTP; DO NOT clear ufcstats' JS challenge
 DELAY_SECONDS = 1.0             # polite pause between requests, PER WORKER
 
 # --- speed knobs ---
-WORKERS        = 8              # parallel fetchers. HTTP backends scale well (try 8).
-                                # Forced to 1 for playwright (sync API isn't thread-safe).
+WORKERS        = 8              # parallel fetchers for the HTTP backends only.
+                                # (Ignored by playwright_async — use PW_CONCURRENCY instead.)
+PW_CONCURRENCY = 6              # playwright_async: number of tabs fetching at once in ONE
+                                # browser. 4-8 is sane; higher = more RAM/CPU, diminishing
+                                # returns, and a more bot-like burst. Start at 6.
 RESUME         = True           # skip URLs already saved in the JSONL from a prior run
 PW_BLOCK_MEDIA = True           # playwright: don't download images/css/fonts (src stays in DOM)
 
@@ -73,6 +79,7 @@ import csv
 import json
 import time
 import random
+import asyncio
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from bs4 import BeautifulSoup
@@ -114,7 +121,7 @@ def _warm_cookies():
     each worker session reuses them instead of triggering 8 challenges at once.
     Fully guarded: any failure just skips warmup and workers fall back to solving
     it themselves (the old behaviour)."""
-    if not WARMUP or FETCH_BACKEND == "playwright":
+    if not WARMUP or FETCH_BACKEND not in ("cloudscraper", "curl_cffi"):
         return
     try:
         _rate_limit()
@@ -244,6 +251,91 @@ def cleanup_fetch():
             _STATE["playwright"].stop()
         except Exception:
             pass
+
+
+# =============================================================================
+# playwright_async — ONE browser + a pool of concurrent tabs.
+# The single shared context clears Cloudflare ONCE (warm page below); every tab
+# then reuses that one clearance, so there's no "8 simultaneous challenges" and
+# no thread-safety problem (async = single event loop, no threads). This is the
+# only path that gives real concurrency AND clears the JS challenge.
+# =============================================================================
+async def _run_playwright_async(todo, handle):
+    from playwright.async_api import async_playwright
+
+    sem = asyncio.Semaphore(max(1, PW_CONCURRENCY))
+
+    async def _block_route(route):
+        try:
+            if route.request.resource_type in _BLOCK_TYPES:
+                await route.abort()
+            else:
+                await route.continue_()
+        except Exception:
+            try:
+                await route.continue_()
+            except Exception:
+                pass
+
+    async def _load(page, url):
+        # domcontentloaded is quicker than networkidle and enough for static pages.
+        await page.goto(url, wait_until="domcontentloaded", timeout=TIMEOUT * 1000)
+        deadline = time.time() + CHALLENGE_WAIT
+        html = await page.content()
+        while _looks_like_challenge(html) and time.time() < deadline:
+            await page.wait_for_timeout(1000)
+            html = await page.content()
+        return html
+
+    async def _load_retry(ctx, url):
+        last = None
+        for attempt in range(1, RETRIES + 1):
+            page = await ctx.new_page()
+            try:
+                html = await _load(page, url)
+                if _looks_like_challenge(html):
+                    raise RuntimeError("JS challenge not cleared")
+                return html
+            except Exception as e:  # noqa: BLE001
+                last = e
+                wait = RETRY_BACKOFF * (2 ** (attempt - 1)) + random.uniform(0, RETRY_JITTER)
+                print("    [retry %d/%d] %s -> %s (waiting %.1fs)" % (attempt, RETRIES, url, e, wait))
+                await asyncio.sleep(wait)
+            finally:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+        raise RuntimeError("failed after %d attempts: %s" % (RETRIES, last))
+
+    async def _worker(ctx, url):
+        async with sem:
+            if DELAY_SECONDS:                       # jittered per-tab spacing
+                await asyncio.sleep(DELAY_SECONDS * random.uniform(0.5, 1.0))
+            try:
+                html = await _load_retry(ctx, url)
+                rec = parse_fight(html, url)        # sync parse; fast relative to the fetch
+                handle(url, rec, None)
+            except Exception as e:  # noqa: BLE001
+                handle(url, None, e)
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True)
+        ctx = await browser.new_context(user_agent=USER_AGENT)
+        if PW_BLOCK_MEDIA:
+            await ctx.route("**/*", _block_route)
+        # Warm the shared context once so every tab inherits a single clearance.
+        try:
+            warm = await ctx.new_page()
+            await _load(warm, BASE_URL)
+            await warm.close()
+            print("  [warmup] shared browser context primed (one clearance for all tabs)")
+        except Exception as e:  # noqa: BLE001
+            print("  [warmup] context prime skipped (%s) — tabs will clear individually" % e)
+        try:
+            await asyncio.gather(*(_worker(ctx, u) for u in todo))
+        finally:
+            await browser.close()
 
 
 # =============================================================================
@@ -506,8 +598,13 @@ def main():
         mode = "a"
     todo = [u for u in urls if u not in done]
     total = len(urls)
-    workers = 1 if FETCH_BACKEND == "playwright" else max(1, WORKERS)
-    print("Backend=%s  fights=%d  done=%d  to_fetch=%d  workers=%d"
+    if FETCH_BACKEND == "playwright":
+        workers = 1
+    elif FETCH_BACKEND == "playwright_async":
+        workers = max(1, PW_CONCURRENCY)
+    else:
+        workers = max(1, WORKERS)
+    print("Backend=%s  fights=%d  done=%d  to_fetch=%d  concurrency=%d"
           % (FETCH_BACKEND, total, len(done), len(todo), workers))
 
     _warm_cookies()   # prime a shared Cloudflare cookie before the workers fan out
@@ -534,8 +631,10 @@ def main():
                 print("  [%d/%d] [FAILED] %s -> %s" % (i, len(todo), url, err))
 
     try:
-        if workers <= 1:
-            for url in todo:                # sequential (playwright path)
+        if FETCH_BACKEND == "playwright_async":
+            asyncio.run(_run_playwright_async(todo, handle))
+        elif workers <= 1:
+            for url in todo:                # sequential (single-tab playwright path)
                 try:
                     handle(url, work(url), None)
                 except Exception as e:
