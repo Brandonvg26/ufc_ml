@@ -27,9 +27,10 @@
 # =============================================================================
 
 # ----------------------------- CONFIG (edit here) ----------------------------
-MAX_EVENTS      = 150          # None = all completed events; or an int for testing
+MAX_EVENTS      = 600          # None = all completed events; or an int for testing
 OUTPUT_DIR      = r"ufc_data/raw"    # created if missing
-OUTPUT_FORMAT   = "csv"         # "csv" or "json"
+OUTPUT_FORMAT   = "csv"         # "csv" or "json"  (final consolidated file)
+WRITE_JSONL_BACKUP = True       # always stream a crash-safe .jsonl (like the 02 scraper)
 DELAY_SECONDS   = 1.5           # polite pause between requests
 FETCH_BACKEND   = "playwright"  # "cloudscraper" | "curl_cffi" | "playwright"
 
@@ -261,6 +262,7 @@ def parse_event(html: str, event: dict):
 def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     out_path = os.path.join(OUTPUT_DIR, f"ufc_events.{OUTPUT_FORMAT}")
+    jsonl_path = os.path.join(OUTPUT_DIR, "ufc_events_raw.jsonl")
     failed_path = os.path.join(OUTPUT_DIR, "failed_events.txt")
 
     print(f"Backend={FETCH_BACKEND}  output={out_path}  format={OUTPUT_FORMAT}")
@@ -293,6 +295,12 @@ def main():
         csv_writer = csv.DictWriter(csv_file, fieldnames=FIELDNAMES)
         csv_writer.writeheader()
 
+    # Stream a raw JSONL backup (one fight per line, flushed per event) — same
+    # crash-safe pattern as the 02 fight-details scraper. Written regardless of
+    # OUTPUT_FORMAT, so you always have a recoverable record even if the run dies
+    # before the final consolidated file is written.
+    jsonl_file = open(jsonl_path, "w", encoding="utf-8") if WRITE_JSONL_BACKUP else None
+
     try:
         for i, event in enumerate(events, start=1):
             print(f"Event {i} of {total}: {event['event_name']}")
@@ -304,6 +312,10 @@ def main():
                 if csv_writer:
                     csv_writer.writerows(rows)
                     csv_file.flush()
+                if jsonl_file:
+                    for row in rows:
+                        jsonl_file.write(json.dumps(row, ensure_ascii=False) + "\n")
+                    jsonl_file.flush()
             except Exception as e:
                 print(f"    [FAILED] {event['event_url']} -> {e}")
                 failed.append(f"{event['event_url']}\t{e}")
@@ -311,6 +323,8 @@ def main():
     finally:
         if csv_file:
             csv_file.close()
+        if jsonl_file:
+            jsonl_file.close()
         cleanup_fetch()
 
     if OUTPUT_FORMAT == "json":
@@ -324,6 +338,8 @@ def main():
     print("\n" + "=" * 60)
     print(f"Done. {len(all_rows)} fights from {total - len(failed)}/{total} events.")
     print(f"Output : {out_path}")
+    if jsonl_file is not None:
+        print(f"JSONL  : {jsonl_path}  (raw per-fight backup)")
     if failed:
         print(f"Failed : {len(failed)} events logged to {failed_path}")
     print("=" * 60)

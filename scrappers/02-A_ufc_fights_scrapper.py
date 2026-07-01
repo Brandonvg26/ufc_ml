@@ -29,11 +29,11 @@
 # =============================================================================
 
 # ----------------------------- CONFIG (edit here) ----------------------------
-INPUT_CSV     = r"ufc_data\fights_list.csv"     # CSV containing the fight-details URLs
+INPUT_CSV     = r"ufc_data\lists\list_fights.csv"     # CSV containing the fight-details URLs
 URL_COLUMN    = "fight_url"     # column to read; if absent, the first column is used
 MAX_FIGHTS    = None             # None = all rows; int caps it (use 2-3 to test)
 OUTPUT_DIR    = r"ufc_data\raw"      # created if missing
-FETCH_BACKEND = "playwright"    # "playwright" | "cloudscraper" | "curl_cffi"
+FETCH_BACKEND = "cloudscraper"    # "playwright" | "cloudscraper" | "curl_cffi"
 DELAY_SECONDS = 1.0             # polite pause between requests, PER WORKER
 
 # --- speed knobs ---
@@ -42,7 +42,19 @@ WORKERS        = 8              # parallel fetchers. HTTP backends scale well (t
 RESUME         = True           # skip URLs already saved in the JSONL from a prior run
 PW_BLOCK_MEDIA = True           # playwright: don't download images/css/fonts (src stays in DOM)
 
-RETRIES        = 3
+# --- anti-throttle knobs (let the HTTP backends survive 8-worker concurrency) ---
+# Connection errors under load are almost always the server/Cloudflare edge
+# dropping bursts from one IP. These three tame that:
+MAX_RPS        = 4.0            # GLOBAL cap on total requests/sec across ALL workers
+                                #   (not per-worker). This is the #1 fix for connection
+                                #   resets. Keep it well under WORKERS. 0 = uncapped.
+WARMUP         = True           # HTTP backends only: solve Cloudflare ONCE on the main
+                                #   thread, then share those cookies with every worker so
+                                #   you don't fire 8 simultaneous challenges from one IP.
+RETRY_JITTER   = 1.5           # max random seconds added to each backoff so the workers
+                                #   stop retrying in lockstep (de-synchronises the herd)
+
+RETRIES        = 4              # bumped from 3: connection blips are usually transient
 RETRY_BACKOFF  = 2.0
 TIMEOUT        = 30
 CHALLENGE_WAIT = 15
@@ -50,6 +62,8 @@ CHALLENGE_WAIT = 15
 USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
               "AppleWebKit/537.36 (KHTML, like Gecko) "
               "Chrome/124.0.0.0 Safari/537.36")
+
+BASE_URL = "http://ufcstats.com/"   # used to warm a Cloudflare clearance cookie
 # -----------------------------------------------------------------------------
 
 import os
@@ -58,6 +72,7 @@ import sys
 import csv
 import json
 import time
+import random
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from bs4 import BeautifulSoup
@@ -69,6 +84,69 @@ META_FIELDS = ["fight_url", "event_name", "event_url"]
 # =============================================================================
 _STATE = {}
 _TLS = threading.local()   # per-thread HTTP sessions (sessions aren't thread-safe)
+
+# --- global rate limiter: caps TOTAL request rate regardless of worker count ---
+# Each caller is handed a monotonically increasing time-slot spaced by 1/MAX_RPS,
+# then sleeps until its slot OUTSIDE the lock. So 8 workers can't burst the edge.
+_RATE_LOCK = threading.Lock()
+_RATE_NEXT = {"t": 0.0}
+
+
+def _rate_limit():
+    if not MAX_RPS or MAX_RPS <= 0:
+        return
+    interval = 1.0 / MAX_RPS
+    with _RATE_LOCK:
+        now = time.monotonic()
+        slot = _RATE_NEXT["t"] if _RATE_NEXT["t"] > now else now
+        _RATE_NEXT["t"] = slot + interval
+    delay = slot - time.monotonic()
+    if delay > 0:
+        time.sleep(delay)
+
+
+# --- cookie warmup: prime Cloudflare ONCE on the main thread, share with workers -
+_WARM = {}  # {"cookies": {...}} once primed
+
+
+def _warm_cookies():
+    """Best-effort. Solve the challenge once single-threaded, stash the cookies so
+    each worker session reuses them instead of triggering 8 challenges at once.
+    Fully guarded: any failure just skips warmup and workers fall back to solving
+    it themselves (the old behaviour)."""
+    if not WARMUP or FETCH_BACKEND == "playwright":
+        return
+    try:
+        _rate_limit()
+        if FETCH_BACKEND == "cloudscraper":
+            import cloudscraper
+            s = cloudscraper.create_scraper(
+                browser={"browser": "chrome", "platform": "windows", "mobile": False})
+            s.get(BASE_URL, timeout=TIMEOUT, headers={"User-Agent": USER_AGENT})
+            _WARM["cookies"] = s.cookies.get_dict()
+        elif FETCH_BACKEND == "curl_cffi":
+            from curl_cffi import requests as creq
+            s = creq.Session(impersonate="chrome")
+            s.get(BASE_URL, timeout=TIMEOUT)
+            try:
+                _WARM["cookies"] = dict(s.cookies.items())
+            except Exception:
+                _WARM["cookies"] = {}
+        n = len(_WARM.get("cookies") or {})
+        print("  [warmup] primed %d cookie(s) for %s workers" % (n, FETCH_BACKEND)
+              if n else "  [warmup] no cookies captured (edge may still challenge each worker)")
+    except Exception as e:  # noqa: BLE001
+        print("  [warmup] skipped (%s) — each worker will solve the challenge itself" % e)
+
+
+def _seed_cookies(session):
+    """Inject the warmed cookies into a freshly-created worker session."""
+    cookies = _WARM.get("cookies")
+    if cookies:
+        try:
+            session.cookies.update(cookies)
+        except Exception:
+            pass
 
 
 def _looks_like_challenge(html):
@@ -86,6 +164,7 @@ def _fetch_cloudscraper(url):
     if s is None:
         s = cloudscraper.create_scraper(
             browser={"browser": "chrome", "platform": "windows", "mobile": False})
+        _seed_cookies(s)
         _TLS.cloudscraper = s
     r = s.get(url, timeout=TIMEOUT, headers={"User-Agent": USER_AGENT})
     r.raise_for_status()
@@ -97,6 +176,7 @@ def _fetch_curl_cffi(url):
     s = getattr(_TLS, "curl", None)
     if s is None:
         s = creq.Session(impersonate="chrome")
+        _seed_cookies(s)
         _TLS.curl = s
     r = s.get(url, timeout=TIMEOUT)
     r.raise_for_status()
@@ -143,14 +223,16 @@ def fetch_html(url):
     last = None
     for attempt in range(1, RETRIES + 1):
         try:
+            _rate_limit()                      # global throttle, every attempt included
             html = _raw_fetch(url)
             if _looks_like_challenge(html):
                 raise RuntimeError("JS challenge not cleared")
             return html
         except Exception as e:  # noqa: BLE001
             last = e
-            wait = RETRY_BACKOFF * attempt
-            print("    [retry %d/%d] %s -> %s (waiting %.0fs)" % (attempt, RETRIES, url, e, wait))
+            # exponential backoff + jitter so 8 workers don't retry in lockstep
+            wait = RETRY_BACKOFF * (2 ** (attempt - 1)) + random.uniform(0, RETRY_JITTER)
+            print("    [retry %d/%d] %s -> %s (waiting %.1fs)" % (attempt, RETRIES, url, e, wait))
             time.sleep(wait)
     raise RuntimeError("failed after %d attempts: %s" % (RETRIES, last))
 
@@ -427,6 +509,8 @@ def main():
     workers = 1 if FETCH_BACKEND == "playwright" else max(1, WORKERS)
     print("Backend=%s  fights=%d  done=%d  to_fetch=%d  workers=%d"
           % (FETCH_BACKEND, total, len(done), len(todo), workers))
+
+    _warm_cookies()   # prime a shared Cloudflare cookie before the workers fan out
 
     lock = threading.Lock()
     counter = {"n": 0}
